@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 import discord
 from discord.ext import tasks
+from aiohttp import web
 
 from cozepy import AsyncJWTOAuthApp, OAuthToken
 
@@ -23,7 +24,9 @@ from cozepy import AsyncJWTOAuthApp, OAuthToken
 DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
 
 # --- FIREBASE CONFIG ---
-FIREBASE_DB_URL: str = os.getenv("FIREBASE_DB_URL", "https://YOUR_DATABASE.firebaseio.com").rstrip('/')
+RAW_FIREBASE_URL = os.getenv("FIREBASE_DB_URL", "https://YOUR_DATABASE.firebaseio.com")
+# Fix link markdown hoặc khoảng trắng nếu lỡ dán nhầm
+FIREBASE_DB_URL: str = re.sub(r"[\[\]\(\)]", "", RAW_FIREBASE_URL).strip().rstrip('/')
 FIREBASE_SECRET: str = os.getenv("FIREBASE_SECRET", "YOUR_FIREBASE_SECRET_KEY")
 
 #Fallback keys
@@ -37,14 +40,9 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama3-70b-8192"
 
 # --- COZE OAUTH CONFIG (JWT Service Application) ---
-# Create a "Service Application" (OAuth App, JWT type) on the Coze console to get
-# these three values. COZE_APP_ID is the App's Client ID, COZE_KEY_ID is the
-# public key ID shown after you upload/generate a key pair, and COZE_PRIVATE_KEY
-# is the matching RSA private key (the .pem content). PAT tokens are no longer used.
 COZE_APP_ID: str = os.getenv("COZE_APP_ID", "1190037587972")
 COZE_KEY_ID: str = os.getenv("COZE_KEY_ID", "LẤY_TRÊN_COZE_CONSOLE")
 COZE_PRIVATE_KEY: str = os.getenv("COZE_PRIVATE_KEY", "NỘI_DUNG_FILE_PEM_HOẶC_CHUỖI_PRIVATE_KEY")
-# How long each minted OAuth access token should be valid for (seconds).
 COZE_TOKEN_TTL_SECONDS: int = int(os.getenv("COZE_TOKEN_TTL_SECONDS", "3600"))
 
 COZE_BOT_ID: str = os.getenv("COZE_BOT_ID", "YOUR_COZE_BOT_ID")
@@ -82,6 +80,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("gd_bot")
+
+# DUMMY WEB SERVER FOR RENDER HEALTH CHECK & UPTIME
+
+async def handle_health_check(request: web.Request) -> web.Response:
+    return web.Response(text="Bot is alive!", status=200)
+
+async def start_dummy_web_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Dummy HTTP Web Server đang lắng nghe trên port {port}")
 
 # FIREBASE DYNAMIC KEYS LOADER
 
@@ -291,19 +304,9 @@ def _read_players_file_sync() -> str:
 
 _TERMINAL_FAILURE_STATUSES = {"failed", "requires_action", "canceled", "cancelled"}
 
-# --- COZE JWT OAUTH (Service Application) TOKEN MANAGEMENT ---
-#
-# Replaces the old fixed-PAT rotation with a JWT Service Application: we sign a
-# short-lived JWT with the app's private key, exchange it for a real Coze
-# access_token via `AsyncJWTOAuthApp.get_access_token()`, cache that token, and
-# transparently mint a new one once it's close to expiring. The token is then
-# used exactly like a PAT would be -- as a `Bearer` header on the same raw
-# aiohttp v3 REST calls (create chat / retrieve / message list) as before.
+# --- COZE JWT OAUTH TOKEN MANAGEMENT ---
 
 def _normalize_private_key(raw_key: str) -> str:
-    """Allow COZE_PRIVATE_KEY to be supplied as a single-line env var using
-    literal ``\\n`` sequences instead of real newlines (common when pasting a
-    PEM key into a platform's environment-variable UI)."""
     if raw_key and "\\n" in raw_key and "\n" not in raw_key:
         return raw_key.replace("\\n", "\n")
     return raw_key
@@ -339,25 +342,16 @@ def _get_coze_jwt_oauth_app() -> AsyncJWTOAuthApp:
 
 
 async def get_coze_access_token() -> Optional[str]:
-    """Return a valid Coze access token, minting/refreshing it via the JWT
-    OAuth Service Application as needed. Cached and reused until shortly
-    before it expires."""
     global _coze_token_cache
 
     if not _coze_jwt_configured():
         log.warning(
-            "Coze JWT OAuth chưa được cấu hình đầy đủ (COZE_APP_ID/COZE_KEY_ID/COZE_PRIVATE_KEY). "
-            "Bỏ qua việc lấy access token."
+            "Coze JWT OAuth chưa được cấu hình đầy đủ. Bỏ qua việc lấy access token."
         )
         return None
 
     async with _coze_token_lock:
         now = int(time.time())
-        # NOTE: `OAuthToken.expires_in` from the Coze token endpoint is actually
-        # an absolute UNIX expiry timestamp (despite the name) -- this mirrors
-        # the caching check cozepy's own JWTAuth/AsyncJWTAuth classes use
-        # internally. A 60s safety buffer avoids using a token that's about to
-        # expire mid-request.
         if _coze_token_cache is not None and now < (_coze_token_cache.expires_in - 60):
             return _coze_token_cache.access_token
 
@@ -372,11 +366,6 @@ async def get_coze_access_token() -> Optional[str]:
 
 
 async def coze_get_response(session: aiohttp.ClientSession, user_message: str, user_id: str) -> Optional[str]:
-    """Create a Coze V3 chat, poll until completed, then read back the answer.
-
-    Auth is obtained via the JWT Service Application instead of a fixed PAT;
-    everything else (create -> poll `status` -> read `answer`) is unchanged.
-    """
     access_token = await get_coze_access_token()
     if not access_token:
         return None
@@ -395,7 +384,6 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         ],
     }
 
-    # 1. Create the chat.
     try:
         async with session.post(
             COZE_CHAT_URL,
@@ -424,7 +412,6 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         log.error(f"Coze create-chat response missing chat_id/conversation_id: {create_data}")
         return None
 
-    # 2. Poll until the chat is completed (or fails / times out).
     max_poll_attempts = 30
     poll_delay_seconds = 1.5
     for _ in range(max_poll_attempts):
@@ -459,7 +446,6 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         log.error("Coze chat polling exceeded max attempts without completing.")
         return None
 
-    # 3. Fetch the message list and extract the assistant's answer.
     try:
         async with session.get(
             COZE_MESSAGE_LIST_URL,
@@ -552,6 +538,7 @@ class GDBotClient(discord.Client):
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
         await fetch_keys_from_firebase(self.http_session)
+        asyncio.create_task(start_dummy_web_server())
 
         if not reset_warns_task.is_running(): reset_warns_task.start()
         if not reload_firebase_keys_task.is_running(): reload_firebase_keys_task.start()
