@@ -25,11 +25,10 @@ DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_
 
 # --- FIREBASE CONFIG ---
 RAW_FIREBASE_URL = os.getenv("FIREBASE_DB_URL", "https://YOUR_DATABASE.firebaseio.com")
-# Fix link markdown hoặc khoảng trắng nếu lỡ dán nhầm
 FIREBASE_DB_URL: str = re.sub(r"[\[\]\(\)]", "", RAW_FIREBASE_URL).strip().rstrip('/')
 FIREBASE_SECRET: str = os.getenv("FIREBASE_SECRET", "YOUR_FIREBASE_SECRET_KEY")
 
-#Fallback keys
+# Fallback keys
 GROQ_API_KEYS: List[str] = [
     os.getenv("GROQ_API_KEY_1", "YOUR_GROQ_API_KEY_1"),
     os.getenv("GROQ_API_KEY_2", "YOUR_GROQ_API_KEY_2"),
@@ -180,7 +179,7 @@ STRICT RULES:
 warns: Dict[int, int] = {}
 ban_tier_index: Dict[int, int] = {}
 bans: Dict[int, Optional[float]] = {}
-user_cooldowns: Dict[int, float] = {}  # Quản lý thời gian cooldown 10s do spam
+user_cooldowns: Dict[int, float] = {}
 state_lock = asyncio.Lock()
 
 # --- CODE SPAM DETECTOR STATE ---
@@ -201,21 +200,16 @@ async def check_code_spam(user_id: int, content: str) -> bool:
         if user_id not in user_msg_texts:
             user_msg_texts[user_id] = []
 
-        # Lọc bỏ các timestamp quá cũ ngoài window
         user_msg_timestamps[user_id] = [
             t for t in user_msg_timestamps[user_id] if now - t <= SPAM_TIME_WINDOW
         ]
         user_msg_timestamps[user_id].append(now)
 
-        # Lưu nội dung tin nhắn để check lặp
         user_msg_texts[user_id].append(content.strip().lower())
         if len(user_msg_texts[user_id]) > SPAM_REPEAT_LIMIT:
             user_msg_texts[user_id].pop(0)
 
-        # Check 1: Quá số tin nhắn cho phép trong X giây
         is_freq_spam = len(user_msg_timestamps[user_id]) > SPAM_MSG_LIMIT
-
-        # Check 2: Lặp lại cùng 1 tin nhắn N lần
         is_repeat_spam = (
             len(user_msg_texts[user_id]) >= SPAM_REPEAT_LIMIT
             and len(set(user_msg_texts[user_id])) == 1
@@ -352,7 +346,7 @@ def _read_players_file_sync() -> str:
 
 _TERMINAL_FAILURE_STATUSES = {"failed", "requires_action", "canceled", "cancelled"}
 
-# --- COZE JWT OAUTH TOKEN MANAGEMENT ---
+# --- COZE JWT OAUTH TOKEN MANAGEMENT & DETAILED LOGGING ---
 
 def _normalize_private_key(raw_key: str) -> str:
     if raw_key and "\\n" in raw_key and "\n" not in raw_key:
@@ -370,11 +364,16 @@ _coze_token_lock = asyncio.Lock()
 
 
 def _coze_jwt_configured() -> bool:
-    return (
-        bool(COZE_APP_ID)
-        and COZE_KEY_ID not in ("", _COZE_PLACEHOLDER_KEY_ID)
-        and COZE_PRIVATE_KEY not in ("", _COZE_PLACEHOLDER_PRIVATE_KEY)
-    )
+    missing = []
+    if not COZE_APP_ID: missing.append("COZE_APP_ID")
+    if COZE_KEY_ID in ("", _COZE_PLACEHOLDER_KEY_ID): missing.append("COZE_KEY_ID")
+    if COZE_PRIVATE_KEY in ("", _COZE_PLACEHOLDER_PRIVATE_KEY): missing.append("COZE_PRIVATE_KEY")
+    if COZE_BOT_ID in ("", "YOUR_COZE_BOT_ID"): missing.append("COZE_BOT_ID")
+
+    if missing:
+        log.warning(f"[Coze Config Error] Biến môi trường Coze chưa đúng/chưa đủ: {', '.join(missing)}")
+        return False
+    return True
 
 
 def _get_coze_jwt_oauth_app() -> AsyncJWTOAuthApp:
@@ -393,9 +392,6 @@ async def get_coze_access_token() -> Optional[str]:
     global _coze_token_cache
 
     if not _coze_jwt_configured():
-        log.warning(
-            "Coze JWT OAuth chưa được cấu hình đầy đủ. Bỏ qua việc lấy access token."
-        )
         return None
 
     async with _coze_token_lock:
@@ -404,18 +400,20 @@ async def get_coze_access_token() -> Optional[str]:
             return _coze_token_cache.access_token
 
         try:
+            log.info("[Coze OAuth] Đang gửi yêu cầu lấy JWT Access Token...")
             app = _get_coze_jwt_oauth_app()
             _coze_token_cache = await app.get_access_token(ttl=COZE_TOKEN_TTL_SECONDS)
-            log.info("Đã tạo mới Coze OAuth access token qua JWT Service Application.")
+            log.info("[Coze OAuth] Đã tạo thành công Coze Access Token mới!")
             return _coze_token_cache.access_token
-        except Exception:
-            log.exception("Không thể lấy Coze OAuth access token qua JWT.")
+        except Exception as e:
+            log.exception(f"[Coze OAuth Error] Không thể tạo JWT Access Token: {e}")
             return None
 
 
 async def coze_get_response(session: aiohttp.ClientSession, user_message: str, user_id: str) -> Optional[str]:
     access_token = await get_coze_access_token()
     if not access_token:
+        log.error("[Coze Error] Không có Access Token, hủy gọi Coze Chat.")
         return None
 
     headers = {
@@ -432,6 +430,8 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         ],
     }
 
+    log.info(f"[Coze API] Khởi tạo Chat với Bot ID: {COZE_BOT_ID} (User ID: {user_id})")
+
     try:
         async with session.post(
             COZE_CHAT_URL,
@@ -439,16 +439,16 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
             json=payload,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
+            body = await resp.text()
             if resp.status != 200:
-                body = await resp.text()
-                log.error(f"Coze create-chat HTTP {resp.status}: {body[:300]}")
+                log.error(f"[Coze Chat Error] HTTP {resp.status}: {body}")
                 return None
             create_data = await resp.json()
     except asyncio.TimeoutError:
-        log.error("Coze create-chat request timed out.")
+        log.error("[Coze Chat Error] Request khởi tạo chat bị Timeout (30s).")
         return None
-    except aiohttp.ClientError as e:
-        log.error(f"Coze create-chat client error: {e}")
+    except Exception as e:
+        log.error(f"[Coze Chat Error] Lỗi kết nối khi tạo chat: {e}")
         return None
 
     chat_info = create_data.get("data") or {}
@@ -457,16 +457,19 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
     status = chat_info.get("status")
 
     if not chat_id or not conversation_id:
-        log.error(f"Coze create-chat response missing chat_id/conversation_id: {create_data}")
+        log.error(f"[Coze Chat Error] Response thiếu chat_id hoặc conversation_id: {create_data}")
         return None
+
+    log.info(f"[Coze API] Chat created. Chat ID: {chat_id}, Status ban đầu: {status}")
 
     max_poll_attempts = 30
     poll_delay_seconds = 1.5
-    for _ in range(max_poll_attempts):
+    for attempt in range(1, max_poll_attempts + 1):
         if status == "completed":
+            log.info(f"[Coze API] Chat hoàn thành thành công (ở lần kiểm tra thứ {attempt}).")
             break
         if status in _TERMINAL_FAILURE_STATUSES:
-            log.error(f"Coze chat ended with terminal status '{status}'.")
+            log.error(f"[Coze Chat Error] Chat thất bại với status: '{status}'")
             return None
 
         await asyncio.sleep(poll_delay_seconds)
@@ -479,19 +482,17 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
-                    log.error(f"Coze retrieve HTTP {resp.status}")
+                    body = await resp.text()
+                    log.error(f"[Coze Retrieve Error] HTTP {resp.status}: {body}")
                     return None
                 retrieve_data = await resp.json()
-        except asyncio.TimeoutError:
-            log.error("Coze retrieve request timed out.")
-            return None
-        except aiohttp.ClientError as e:
-            log.error(f"Coze retrieve client error: {e}")
+        except Exception as e:
+            log.error(f"[Coze Retrieve Error] Lỗi khi poll status: {e}")
             return None
 
         status = (retrieve_data.get("data") or {}).get("status")
     else:
-        log.error("Coze chat polling exceeded max attempts without completing.")
+        log.error("[Coze Chat Error] Vượt quá số lần kiểm tra (30 lần) mà chưa hoàn thành.")
         return None
 
     try:
@@ -502,19 +503,17 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             if resp.status != 200:
-                log.error(f"Coze message-list HTTP {resp.status}")
+                body = await resp.text()
+                log.error(f"[Coze Message List Error] HTTP {resp.status}: {body}")
                 return None
             messages_data = await resp.json()
-    except asyncio.TimeoutError:
-        log.error("Coze message-list request timed out.")
-        return None
-    except aiohttp.ClientError as e:
-        log.error(f"Coze message-list client error: {e}")
+    except Exception as e:
+        log.error(f"[Coze Message List Error] Lỗi khi tải tin nhắn: {e}")
         return None
 
     msg_list = messages_data.get("data") or []
     if not isinstance(msg_list, list):
-        log.error(f"Unexpected Coze message-list payload shape: {messages_data}")
+        log.error(f"[Coze Message List Error] Format tin nhắn trả về không hợp lệ: {messages_data}")
         return None
 
     answer_parts = [
@@ -523,8 +522,12 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         if isinstance(m, dict) and m.get("type") == "answer" and m.get("content")
     ]
     if not answer_parts:
+        log.warning("[Coze API] Hoàn thành nhưng không nhận được nội dung câu trả lời (answer_parts rỗng).")
         return None
-    return "\n".join(answer_parts).strip() or None
+
+    final_answer = "\n".join(answer_parts).strip()
+    log.info(f"[Coze API] Trả về câu trả lời thành công ({len(final_answer)} ký tự).")
+    return final_answer or None
 
 async def send_long_message(message: discord.Message, text: str) -> None:
     if not text: return
@@ -548,7 +551,6 @@ async def handle_ai_routing(message: discord.Message, content: str, session: aio
     cleaned = router_output.strip().strip("`").strip('"').strip("'").strip()
 
     if cleaned.lower() == "no":
-        # NSFW / Toxic -> Từ chối trả lời, KHÔNG warn/ban
         await message.reply("No")
     elif cleaned.lower().startswith("3"):
         parts = cleaned.split(maxsplit=2)
@@ -616,9 +618,8 @@ async def on_message(message: discord.Message) -> None:
     now = time.time()
     cooldown_end = user_cooldowns.get(message.author.id, 0.0)
 
-    # Nếu phát hiện spam
     if await check_code_spam(message.author.id, content):
-        user_cooldowns[message.author.id] = now + SPAM_COOLDOWN_TIME  # Đặt/Reset 10s cooldown
+        user_cooldowns[message.author.id] = now + SPAM_COOLDOWN_TIME
         count, ban_label, ban_expiry = await add_warn_and_maybe_ban(message.author.id)
         if ban_label:
             await message.reply(f"🚫 {message.author.mention} got {WARNS_TO_BAN} warn spam và got banned **{format_remaining(ban_expiry)}**.")
@@ -626,7 +627,6 @@ async def on_message(message: discord.Message) -> None:
             await message.reply(f"⚠️ {message.author.mention}, stop spamming! (Warn {count}/{WARNS_TO_BAN})")
         return
 
-    # Nếu đang trong 10s cooldown do dính spam trước đó -> Bỏ qua không trả lời
     if now < cooldown_end:
         return
 
