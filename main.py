@@ -170,7 +170,7 @@ You will be provided with raw text containing list data (levels with ranks, or p
 
 STRICT RULES:
 - ONLY use information directly present in the provided text. Do NOT hallucinate or extrapolate details not explicitly stated.
-- ALWAYS reply in VIETNAMESE. Keep responses concise, natural, and directly to the point.
+- Keep responses concise, natural, and directly to the point.
 - If a query exceeds the scope of the provided data (e.g., asking for top 200 when the list only contains 100 entries), logically detect this limitation and explicitly state how far the list goes, rather than guessing or providing incorrect answers.
 - If the requested information cannot be found in the provided text, explicitly reply that the information was not found in the given dataset.
 """
