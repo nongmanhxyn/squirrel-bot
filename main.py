@@ -37,7 +37,7 @@ GROQ_API_KEYS: List[str] = [
 ]
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama3-70b-8192"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 # --- COZE OAUTH CONFIG (JWT Service Application) ---
 COZE_APP_ID: str = os.getenv("COZE_APP_ID", "1190037587972")
