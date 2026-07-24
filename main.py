@@ -346,7 +346,7 @@ def _read_players_file_sync() -> str:
 
 _TERMINAL_FAILURE_STATUSES = {"failed", "requires_action", "canceled", "cancelled"}
 
-# --- COZE JWT OAUTH TOKEN MANAGEMENT & DETAILED LOGGING ---
+# --- COZE JWT OAUTH TOKEN MANAGEMENT & DETAILED ERROR DISCORD OUTPUT ---
 
 def _normalize_private_key(raw_key: str) -> str:
     if raw_key and "\\n" in raw_key and "\n" not in raw_key:
@@ -370,10 +370,7 @@ def _coze_jwt_configured() -> bool:
     if COZE_PRIVATE_KEY in ("", _COZE_PLACEHOLDER_PRIVATE_KEY): missing.append("COZE_PRIVATE_KEY")
     if COZE_BOT_ID in ("", "YOUR_COZE_BOT_ID"): missing.append("COZE_BOT_ID")
 
-    if missing:
-        log.warning(f"[Coze Config Error] Biến môi trường Coze chưa đúng/chưa đủ: {', '.join(missing)}")
-        return False
-    return True
+    return len(missing) == 0
 
 
 def _get_coze_jwt_oauth_app() -> AsyncJWTOAuthApp:
@@ -410,11 +407,18 @@ async def get_coze_access_token() -> Optional[str]:
             return None
 
 
-async def coze_get_response(session: aiohttp.ClientSession, user_message: str, user_id: str) -> Optional[str]:
+async def coze_get_response(session: aiohttp.ClientSession, user_message: str, user_id: str) -> str:
+    if not _coze_jwt_configured():
+        missing = []
+        if not COZE_APP_ID: missing.append("COZE_APP_ID")
+        if COZE_KEY_ID in ("", _COZE_PLACEHOLDER_KEY_ID): missing.append("COZE_KEY_ID")
+        if COZE_PRIVATE_KEY in ("", _COZE_PLACEHOLDER_PRIVATE_KEY): missing.append("COZE_PRIVATE_KEY")
+        if COZE_BOT_ID in ("", "YOUR_COZE_BOT_ID"): missing.append("COZE_BOT_ID")
+        return f"❌ [Coze Config Error] Biến môi trường chưa đủ: {', '.join(missing)}"
+
     access_token = await get_coze_access_token()
     if not access_token:
-        log.error("[Coze Error] Không có Access Token, hủy gọi Coze Chat.")
-        return None
+        return "❌ [Coze OAuth Error] Không tạo được JWT Token (Kiểm tra lại Private Key hoặc Key ID)."
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -442,14 +446,12 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
             body = await resp.text()
             if resp.status != 200:
                 log.error(f"[Coze Chat Error] HTTP {resp.status}: {body}")
-                return None
+                return f"❌ [Coze Chat API Error] HTTP {resp.status}: {body[:300]}"
             create_data = await resp.json()
     except asyncio.TimeoutError:
-        log.error("[Coze Chat Error] Request khởi tạo chat bị Timeout (30s).")
-        return None
+        return "❌ [Coze Error] Request khởi tạo chat bị Timeout (30s)."
     except Exception as e:
-        log.error(f"[Coze Chat Error] Lỗi kết nối khi tạo chat: {e}")
-        return None
+        return f"❌ [Coze Error] Lỗi kết nối khi gửi tin nhắn: {e}"
 
     chat_info = create_data.get("data") or {}
     chat_id = chat_info.get("id")
@@ -457,20 +459,15 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
     status = chat_info.get("status")
 
     if not chat_id or not conversation_id:
-        log.error(f"[Coze Chat Error] Response thiếu chat_id hoặc conversation_id: {create_data}")
-        return None
-
-    log.info(f"[Coze API] Chat created. Chat ID: {chat_id}, Status ban đầu: {status}")
+        return f"❌ [Coze Chat Error] Coze trả về thiếu chat_id/conversation_id: {create_data}"
 
     max_poll_attempts = 30
     poll_delay_seconds = 1.5
     for attempt in range(1, max_poll_attempts + 1):
         if status == "completed":
-            log.info(f"[Coze API] Chat hoàn thành thành công (ở lần kiểm tra thứ {attempt}).")
             break
         if status in _TERMINAL_FAILURE_STATUSES:
-            log.error(f"[Coze Chat Error] Chat thất bại với status: '{status}'")
-            return None
+            return f"❌ [Coze Chat Error] Chat bị thất bại với status: '{status}'"
 
         await asyncio.sleep(poll_delay_seconds)
 
@@ -483,17 +480,14 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    log.error(f"[Coze Retrieve Error] HTTP {resp.status}: {body}")
-                    return None
+                    return f"❌ [Coze Retrieve Error] HTTP {resp.status}: {body[:300]}"
                 retrieve_data = await resp.json()
         except Exception as e:
-            log.error(f"[Coze Retrieve Error] Lỗi khi poll status: {e}")
-            return None
+            return f"❌ [Coze Retrieve Error] Lỗi khi kiểm tra trạng thái chat: {e}"
 
         status = (retrieve_data.get("data") or {}).get("status")
     else:
-        log.error("[Coze Chat Error] Vượt quá số lần kiểm tra (30 lần) mà chưa hoàn thành.")
-        return None
+        return "❌ [Coze Error] Đã đợi 30 lần kiểm tra mà Coze chưa xử lý xong."
 
     try:
         async with session.get(
@@ -504,17 +498,14 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                log.error(f"[Coze Message List Error] HTTP {resp.status}: {body}")
-                return None
+                return f"❌ [Coze Message List Error] HTTP {resp.status}: {body[:300]}"
             messages_data = await resp.json()
     except Exception as e:
-        log.error(f"[Coze Message List Error] Lỗi khi tải tin nhắn: {e}")
-        return None
+        return f"❌ [Coze Message List Error] Lỗi khi lấy danh sách tin nhắn: {e}"
 
     msg_list = messages_data.get("data") or []
     if not isinstance(msg_list, list):
-        log.error(f"[Coze Message List Error] Format tin nhắn trả về không hợp lệ: {messages_data}")
-        return None
+        return f"❌ [Coze Message List Error] Format phản hồi rỗng/sai: {messages_data}"
 
     answer_parts = [
         m.get("content", "")
@@ -522,12 +513,9 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         if isinstance(m, dict) and m.get("type") == "answer" and m.get("content")
     ]
     if not answer_parts:
-        log.warning("[Coze API] Hoàn thành nhưng không nhận được nội dung câu trả lời (answer_parts rỗng).")
-        return None
+        return "❌ [Coze Error] Coze phản hồi completed nhưng không có nội dung chữ."
 
-    final_answer = "\n".join(answer_parts).strip()
-    log.info(f"[Coze API] Trả về câu trả lời thành công ({len(final_answer)} ký tự).")
-    return final_answer or None
+    return "\n".join(answer_parts).strip()
 
 async def send_long_message(message: discord.Message, text: str) -> None:
     if not text: return
@@ -570,7 +558,7 @@ async def handle_ai_routing(message: discord.Message, content: str, session: aio
                 await message.reply("Error")
     else:
         answer = await coze_get_response(session, content, str(message.author.id))
-        await send_long_message(message, answer or "Rate limit hahahahaha")
+        await send_long_message(message, answer)
 
 intents = discord.Intents.default()
 intents.message_content = True
