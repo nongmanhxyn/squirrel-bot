@@ -16,8 +16,6 @@ import discord
 from discord.ext import tasks
 from aiohttp import web
 
-from cozepy import AsyncJWTOAuthApp, OAuthToken
-
 
 # CONFIGURATION
 
@@ -38,13 +36,10 @@ GROQ_API_KEYS: List[str] = [
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-# --- COZE OAUTH CONFIG (JWT Service Application) ---
-COZE_APP_ID: str = os.getenv("COZE_APP_ID", "1190037587972")
-COZE_KEY_ID: str = os.getenv("COZE_KEY_ID", "LẤY_TRÊN_COZE_CONSOLE")
-COZE_PRIVATE_KEY: str = os.getenv("COZE_PRIVATE_KEY", "NỘI_DUNG_FILE_PEM_HOẶC_CHUỖI_PRIVATE_KEY")
-COZE_TOKEN_TTL_SECONDS: int = int(os.getenv("COZE_TOKEN_TTL_SECONDS", "3600"))
-
+# --- COZE PAT CONFIG ---
+COZE_PAT: str = os.getenv("COZE_PAT", "")
 COZE_BOT_ID: str = os.getenv("COZE_BOT_ID", "YOUR_COZE_BOT_ID")
+
 COZE_BASE_URL = "https://api.coze.com"
 COZE_CHAT_URL = f"{COZE_BASE_URL}/v3/chat"
 COZE_RETRIEVE_URL = f"{COZE_BASE_URL}/v3/chat/retrieve"
@@ -98,7 +93,6 @@ async def start_dummy_web_server() -> None:
 # FIREBASE DYNAMIC KEYS LOADER
 
 async def fetch_keys_from_firebase(session: aiohttp.ClientSession) -> None:
-    """Read API keys from Firebase Realtime DB and update global lists."""
     global GROQ_API_KEYS
     if "YOUR_DATABASE" in FIREBASE_DB_URL:
         log.warning("Firebase DB URL chưa được cấu hình. Bỏ qua fetch key.")
@@ -182,27 +176,20 @@ bans: Dict[int, Optional[float]] = {}
 user_cooldowns: Dict[int, float] = {}
 state_lock = asyncio.Lock()
 
-# --- CODE SPAM DETECTOR STATE ---
 user_msg_timestamps: Dict[int, List[float]] = {}
 user_msg_texts: Dict[int, List[str]] = {}
-SPAM_MSG_LIMIT = 4        # Tối đa 4 msgs trong time window
-SPAM_TIME_WINDOW = 3.0    # Cửa sổ thời gian 3 giây
-SPAM_REPEAT_LIMIT = 3     # Lặp lại cùng 1 câu 3 lần liên tiếp
-SPAM_COOLDOWN_TIME = 10.0 # Bắt buộc chờ 10s sau khi dính spam
+SPAM_MSG_LIMIT = 4
+SPAM_TIME_WINDOW = 3.0
+SPAM_REPEAT_LIMIT = 3
+SPAM_COOLDOWN_TIME = 10.0
 
 async def check_code_spam(user_id: int, content: str) -> bool:
-    """Check spam bằng Python: Tần suất gửi tin nhắn + Tin nhắn lặp lại liên tiếp."""
     async with state_lock:
         now = time.time()
-        
-        if user_id not in user_msg_timestamps:
-            user_msg_timestamps[user_id] = []
-        if user_id not in user_msg_texts:
-            user_msg_texts[user_id] = []
+        if user_id not in user_msg_timestamps: user_msg_timestamps[user_id] = []
+        if user_id not in user_msg_texts: user_msg_texts[user_id] = []
 
-        user_msg_timestamps[user_id] = [
-            t for t in user_msg_timestamps[user_id] if now - t <= SPAM_TIME_WINDOW
-        ]
+        user_msg_timestamps[user_id] = [t for t in user_msg_timestamps[user_id] if now - t <= SPAM_TIME_WINDOW]
         user_msg_timestamps[user_id].append(now)
 
         user_msg_texts[user_id].append(content.strip().lower())
@@ -219,16 +206,13 @@ async def check_code_spam(user_id: int, content: str) -> bool:
             user_msg_timestamps[user_id].clear()
             user_msg_texts[user_id].clear()
             return True
-
         return False
 
 async def is_banned(user_id: int) -> Tuple[bool, Optional[float]]:
     async with state_lock:
-        if user_id not in bans:
-            return False, None
+        if user_id not in bans: return False, None
         expiry = bans[user_id]
-        if expiry is None:
-            return True, None
+        if expiry is None: return True, None
         if time.time() >= expiry:
             del bans[user_id]
             return False, None
@@ -249,11 +233,9 @@ async def add_warn_and_maybe_ban(user_id: int) -> Tuple[int, Optional[str], Opti
         return count, None, None
 
 def format_remaining(expiry: Optional[float]) -> str:
-    if expiry is None:
-        return "permanent"
+    if expiry is None: return "permanent"
     remaining = int(expiry - time.time())
-    if remaining <= 0:
-        return "less than a second"
+    if remaining <= 0: return "less than a second"
     days, remainder = divmod(remaining, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -312,8 +294,7 @@ async def call_groq(
         return None
 
     choices = data.get("choices") or []
-    if not choices:
-        return None
+    if not choices: return None
     return (choices[0].get("message") or {}).get("content", "").strip()
 
 _GDOC_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]+)")
@@ -346,82 +327,16 @@ def _read_players_file_sync() -> str:
 
 _TERMINAL_FAILURE_STATUSES = {"failed", "requires_action", "canceled", "cancelled"}
 
-# --- COZE JWT OAUTH TOKEN MANAGEMENT & DETAILED ERROR DISCORD OUTPUT ---
-
-def _normalize_private_key(raw_key: str) -> str:
-    if raw_key and "\\n" in raw_key and "\n" not in raw_key:
-        return raw_key.replace("\\n", "\n")
-    return raw_key
-
-COZE_PRIVATE_KEY = _normalize_private_key(COZE_PRIVATE_KEY)
-
-_COZE_PLACEHOLDER_KEY_ID = "LẤY_TRÊN_COZE_CONSOLE"
-_COZE_PLACEHOLDER_PRIVATE_KEY = "NỘI_DUNG_FILE_PEM_HOẶC_CHUỖI_PRIVATE_KEY"
-
-_coze_jwt_oauth_app: Optional[AsyncJWTOAuthApp] = None
-_coze_token_cache: Optional[OAuthToken] = None
-_coze_token_lock = asyncio.Lock()
-
-
-def _coze_jwt_configured() -> bool:
-    missing = []
-    if not COZE_APP_ID: missing.append("COZE_APP_ID")
-    if COZE_KEY_ID in ("", _COZE_PLACEHOLDER_KEY_ID): missing.append("COZE_KEY_ID")
-    if COZE_PRIVATE_KEY in ("", _COZE_PLACEHOLDER_PRIVATE_KEY): missing.append("COZE_PRIVATE_KEY")
-    if COZE_BOT_ID in ("", "YOUR_COZE_BOT_ID"): missing.append("COZE_BOT_ID")
-
-    return len(missing) == 0
-
-
-def _get_coze_jwt_oauth_app() -> AsyncJWTOAuthApp:
-    global _coze_jwt_oauth_app
-    if _coze_jwt_oauth_app is None:
-        _coze_jwt_oauth_app = AsyncJWTOAuthApp(
-            client_id=COZE_APP_ID,
-            private_key=COZE_PRIVATE_KEY,
-            public_key_id=COZE_KEY_ID,
-            base_url=COZE_BASE_URL,
-        )
-    return _coze_jwt_oauth_app
-
-
-async def get_coze_access_token() -> Optional[str]:
-    global _coze_token_cache
-
-    if not _coze_jwt_configured():
-        return None
-
-    async with _coze_token_lock:
-        now = int(time.time())
-        if _coze_token_cache is not None and now < (_coze_token_cache.expires_in - 60):
-            return _coze_token_cache.access_token
-
-        try:
-            log.info("[Coze OAuth] Đang gửi yêu cầu lấy JWT Access Token...")
-            app = _get_coze_jwt_oauth_app()
-            _coze_token_cache = await app.get_access_token(ttl=COZE_TOKEN_TTL_SECONDS)
-            log.info("[Coze OAuth] Đã tạo thành công Coze Access Token mới!")
-            return _coze_token_cache.access_token
-        except Exception as e:
-            log.exception(f"[Coze OAuth Error] Không thể tạo JWT Access Token: {e}")
-            return None
-
+# --- COZE PAT API CALL ---
 
 async def coze_get_response(session: aiohttp.ClientSession, user_message: str, user_id: str) -> str:
-    if not _coze_jwt_configured():
-        missing = []
-        if not COZE_APP_ID: missing.append("COZE_APP_ID")
-        if COZE_KEY_ID in ("", _COZE_PLACEHOLDER_KEY_ID): missing.append("COZE_KEY_ID")
-        if COZE_PRIVATE_KEY in ("", _COZE_PLACEHOLDER_PRIVATE_KEY): missing.append("COZE_PRIVATE_KEY")
-        if COZE_BOT_ID in ("", "YOUR_COZE_BOT_ID"): missing.append("COZE_BOT_ID")
-        return f"❌ [Coze Config Error] Biến môi trường chưa đủ: {', '.join(missing)}"
-
-    access_token = await get_coze_access_token()
-    if not access_token:
-        return "❌ [Coze OAuth Error] Không tạo được JWT Token (Kiểm tra lại Private Key hoặc Key ID)."
+    if not COZE_PAT:
+        return "❌ [Coze Config Error] Thiếu biến môi trường COZE_PAT trên Render!"
+    if not COZE_BOT_ID or COZE_BOT_ID == "YOUR_COZE_BOT_ID":
+        return "❌ [Coze Config Error] Thiếu hoặc sai COZE_BOT_ID!"
 
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {COZE_PAT}",
         "Content-Type": "application/json",
     }
     payload = {
@@ -434,7 +349,7 @@ async def coze_get_response(session: aiohttp.ClientSession, user_message: str, u
         ],
     }
 
-    log.info(f"[Coze API] Khởi tạo Chat với Bot ID: {COZE_BOT_ID} (User ID: {user_id})")
+    log.info(f"[Coze API PAT] Khởi tạo Chat với Bot ID: {COZE_BOT_ID}")
 
     try:
         async with session.post(
@@ -602,7 +517,6 @@ async def on_message(message: discord.Message) -> None:
         await message.reply("Hello World")
         return
 
-    # --- CODE CHECK SPAM & COOLDOWN ---
     now = time.time()
     cooldown_end = user_cooldowns.get(message.author.id, 0.0)
 
