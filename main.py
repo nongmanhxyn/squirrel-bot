@@ -170,7 +170,7 @@ You will be provided with raw text containing list data (levels with ranks, or p
 
 STRICT RULES:
 - ONLY use information directly present in the provided text. Do NOT hallucinate or extrapolate details not explicitly stated.
-- Keep responses concise, natural, and directly to the point.
+- Reply in the same language as the user's query (if user asks in English or requests English, reply in English; default to Vietnamese if unspecified). Keep responses concise, natural, and directly to the point.
 - If a query exceeds the scope of the provided data (e.g., asking for top 200 when the list only contains 100 entries), logically detect this limitation and explicitly state how far the list goes, rather than guessing or providing incorrect answers.
 - If the requested information cannot be found in the provided text, explicitly reply that the information was not found in the given dataset.
 """
@@ -180,6 +180,7 @@ STRICT RULES:
 warns: Dict[int, int] = {}
 ban_tier_index: Dict[int, int] = {}
 bans: Dict[int, Optional[float]] = {}
+user_cooldowns: Dict[int, float] = {}  # Quản lý thời gian cooldown 10s do spam
 state_lock = asyncio.Lock()
 
 # --- CODE SPAM DETECTOR STATE ---
@@ -188,6 +189,7 @@ user_msg_texts: Dict[int, List[str]] = {}
 SPAM_MSG_LIMIT = 4        # Tối đa 4 msgs trong time window
 SPAM_TIME_WINDOW = 3.0    # Cửa sổ thời gian 3 giây
 SPAM_REPEAT_LIMIT = 3     # Lặp lại cùng 1 câu 3 lần liên tiếp
+SPAM_COOLDOWN_TIME = 10.0 # Bắt buộc chờ 10s sau khi dính spam
 
 async def check_code_spam(user_id: int, content: str) -> bool:
     """Check spam bằng Python: Tần suất gửi tin nhắn + Tin nhắn lặp lại liên tiếp."""
@@ -610,13 +612,22 @@ async def on_message(message: discord.Message) -> None:
         await message.reply("Hello World")
         return
 
-    # --- CODE CHECK SPAM ---
+    # --- CODE CHECK SPAM & COOLDOWN ---
+    now = time.time()
+    cooldown_end = user_cooldowns.get(message.author.id, 0.0)
+
+    # Nếu phát hiện spam
     if await check_code_spam(message.author.id, content):
+        user_cooldowns[message.author.id] = now + SPAM_COOLDOWN_TIME  # Đặt/Reset 10s cooldown
         count, ban_label, ban_expiry = await add_warn_and_maybe_ban(message.author.id)
         if ban_label:
             await message.reply(f"🚫 {message.author.mention} got {WARNS_TO_BAN} warn spam và got banned **{format_remaining(ban_expiry)}**.")
         else:
             await message.reply(f"⚠️ {message.author.mention}, stop spamming! (Warn {count}/{WARNS_TO_BAN})")
+        return
+
+    # Nếu đang trong 10s cooldown do dính spam trước đó -> Bỏ qua không trả lời
+    if now < cooldown_end:
         return
 
     async with message.channel.typing():
